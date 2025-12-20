@@ -14,7 +14,7 @@ function App() {
   });
 
   useEffect(() => {
-    fetch('http://localhost:8080/ip')
+    fetch('/ip')
       .then(res => res.json())
       .then(data => {
         setIp(data.ip);
@@ -30,7 +30,7 @@ function App() {
   const handleSubmit = (values: typeof form.values) => {
     setSubmitted(true);
 
-    fetch('http://localhost:8080/whitelist', {
+    fetch('/whitelist', {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',

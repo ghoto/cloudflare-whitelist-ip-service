@@ -163,6 +163,12 @@ func handleWhitelist(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Validate IP
+	if net.ParseIP(ip) == nil {
+		http.Error(w, "Invalid IP address detected", http.StatusBadRequest)
+		return
+	}
+
 	// 2. Parse Duration
 	var req WhitelistRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
