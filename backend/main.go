@@ -1,0 +1,473 @@
+package main
+
+import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"fmt"
+	"io"
+	"log"
+	"net"
+	"net/http"
+	"os"
+	"strings"
+	"sync"
+	"time"
+
+	"github.com/go-chi/chi/v5"
+	"github.com/go-chi/chi/v5/middleware"
+	"github.com/go-chi/cors"
+)
+
+type WhitelistRequest struct {
+	Duration string `json:"duration"`
+}
+
+type WhitelistResponse struct {
+	Message string `json:"message"`
+	IP      string `json:"ip"`
+}
+
+var (
+	apiToken = os.Getenv("CLOUDFLARE_API_TOKEN")
+	zoneID   = os.Getenv("CLOUDFLARE_ZONE_ID")
+	// For this example, we'll assume we are adding to an existing IP List utilized by a WAF rule
+	// OR adding a literal IP rule to a Firewall Access Rule.
+	// Let's go with Firewall Access Rule (IP Access Rules) as it's simpler for "whitelist IP".
+	// Alternatively, replacing an IP List content is common for Zero Trust.
+	// Given "Cloudflare Access policy", we'd modify an Access Group.
+	// We'll implement updating an Access Policy (Account Level).
+	accountID = os.Getenv("CLOUDFLARE_ACCOUNT_ID")
+	policyID  = os.Getenv("CLOUDFLARE_POLICY_ID")
+
+	// Persistence
+	storeFile = "whitelist_store.json"
+	store     = &WhitelistStore{
+		Entries: make(map[string]time.Time),
+	}
+)
+
+// WhitelistStore handles persistence
+type WhitelistStore struct {
+	sync.RWMutex
+	Entries map[string]time.Time `json:"entries"`
+}
+
+func (s *WhitelistStore) Load() error {
+	s.Lock()
+	defer s.Unlock()
+
+	f, err := os.Open(storeFile)
+	if os.IsNotExist(err) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+
+	bytes, err := io.ReadAll(f)
+	if err != nil {
+		return err
+	}
+
+	return json.Unmarshal(bytes, &s.Entries)
+}
+
+func (s *WhitelistStore) Save() error {
+	s.RLock()
+	defer s.RUnlock()
+
+	bytes, err := json.MarshalIndent(s.Entries, "", "  ")
+	if err != nil {
+		return err
+	}
+
+	return os.WriteFile(storeFile, bytes, 0644)
+}
+
+func (s *WhitelistStore) Add(ip string, expiry time.Time) {
+	s.Lock()
+	s.Entries[ip] = expiry
+	s.Unlock()
+	s.Save()
+}
+
+func (s *WhitelistStore) Remove(ip string) {
+	s.Lock()
+	delete(s.Entries, ip)
+	s.Unlock()
+	s.Save()
+}
+
+func main() {
+	port := os.Getenv("PORT")
+	if port == "" {
+		port = "8080"
+	}
+
+	if apiToken == "" {
+		log.Println("Warning: CLOUDFLARE_API_TOKEN is not set")
+	}
+
+	r := chi.NewRouter()
+
+	// Middleware
+	r.Use(middleware.Logger)
+	r.Use(middleware.Recoverer)
+	r.Use(cors.Handler(cors.Options{
+		AllowedOrigins:   []string{"*"}, // Adjust for production
+		AllowedMethods:   []string{"GET", "POST", "OPTIONS"},
+		AllowedHeaders:   []string{"Accept", "Authorization", "Content-Type", "X-CSRF-Token"},
+		ExposedHeaders:   []string{"Link"},
+		AllowCredentials: true,
+		MaxAge:           300,
+	}))
+
+	// Static files from /dist
+	workDir, _ := os.Getwd()
+	filesDir := http.Dir(fmt.Sprintf("%s/dist", workDir))
+	FileServer(r, "/", filesDir)
+
+	r.Get("/ip", handleGetIP)
+	r.Post("/whitelist", handleWhitelist)
+
+	// Load state
+	if err := store.Load(); err != nil {
+		log.Printf("Error loading store: %v", err)
+	} else {
+		log.Printf("Loaded %d whitelisted IPs from store", len(store.Entries))
+	}
+
+	// Start Daemon
+	go startExpiryDaemon()
+
+	fmt.Printf("Starting server on port %s...\n", port)
+	if err := http.ListenAndServe(":"+port, r); err != nil {
+		log.Fatalf("Error starting server: %v", err)
+	}
+}
+
+func handleGetIP(w http.ResponseWriter, r *http.Request) {
+	ip := getClientIP(r)
+	resp := map[string]string{"ip": ip}
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(resp)
+}
+
+func handleWhitelist(w http.ResponseWriter, r *http.Request) {
+	// 1. Extract IP
+	ip := getClientIP(r)
+	if ip == "" {
+		http.Error(w, "Could not determine client IP", http.StatusBadRequest)
+		return
+	}
+
+	// 2. Parse Duration
+	var req WhitelistRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, "Invalid request body", http.StatusBadRequest)
+		return
+	}
+
+	duration := 60 * time.Minute // default
+	// Support "0.5" for 30s, or explicit units if frontend sent them.
+	// We assume frontend sends string minutes usually.
+	if d, err := time.ParseDuration(req.Duration + "m"); err == nil {
+		duration = d
+	} else if d, err := time.ParseDuration(req.Duration); err == nil {
+		// Fallback for "30s" etc
+		duration = d
+	}
+
+	log.Printf("Whitelisting IP: %s for %v", ip, duration)
+
+	// 3. Update Cloudflare
+	if err := addToCloudflareAccessPolicy(r.Context(), ip); err != nil {
+		log.Printf("Error updating Cloudflare: %v", err)
+		if apiToken != "" {
+			http.Error(w, "Failed to update Cloudflare policy", http.StatusInternalServerError)
+			return
+		}
+	} else {
+		// Persist Expiry
+		expiry := time.Now().Add(duration)
+		store.Add(ip, expiry)
+		log.Printf("IP %s added to store, expires at %s", ip, expiry)
+	}
+
+	resp := WhitelistResponse{
+		Message: "Success",
+		IP:      ip,
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(resp)
+}
+
+func getClientIP(r *http.Request) string {
+	// Priority 1: CF-Connecting-IP (Cloudflare)
+	if ip := r.Header.Get("CF-Connecting-IP"); ip != "" {
+		return ip
+	}
+
+	// Priority 2: X-Forwarded-For
+	if ip := r.Header.Get("X-Forwarded-For"); ip != "" {
+		parts := strings.Split(ip, ",")
+		return strings.TrimSpace(parts[0])
+	}
+
+	// Priority 3: RemoteAddr
+	ip, _, err := net.SplitHostPort(r.RemoteAddr)
+	if err != nil {
+		ip = r.RemoteAddr
+	}
+
+	// If the IP is private (Localhost or Docker Network), fallback to fetching public IP
+	// This ensures local testing works by whitelisting the actual Public IP.
+	if isPrivateIP(ip) {
+		log.Printf("Detected private IP %s, fetching public IP...", ip)
+		if pubIP, err := getPublicIP(); err == nil && pubIP != "" {
+			return pubIP
+		}
+		log.Println("Failed to fetch public IP, using private IP")
+	}
+
+	return ip
+}
+
+func isPrivateIP(ipStr string) bool {
+	ip := net.ParseIP(ipStr)
+	if ip == nil {
+		return false // Should not happen if coming from RemoteAddr
+	}
+
+	// Check for Loopback
+	if ip.IsLoopback() {
+		return true
+	}
+
+	// Check for Private Networks
+	privateIPBlocks := []*net.IPNet{
+		parseCIDR("10.0.0.0/8"),
+		parseCIDR("172.16.0.0/12"),
+		parseCIDR("192.168.0.0/16"),
+	}
+
+	for _, block := range privateIPBlocks {
+		if block.Contains(ip) {
+			return true
+		}
+	}
+	return false
+}
+
+func parseCIDR(s string) *net.IPNet {
+	_, block, _ := net.ParseCIDR(s)
+	return block
+}
+
+func getPublicIP() (string, error) {
+	resp, err := http.Get("https://api.ipify.org?format=text")
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+
+	ip, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return "", err
+	}
+	return string(ip), nil
+}
+
+// Structs for Cloudflare API
+type CFAccessPolicyResponse struct {
+	Success bool          `json:"success"`
+	Errors  []interface{} `json:"errors"`
+	Result  struct {
+		Name     string        `json:"name"`
+		Decision string        `json:"decision"`
+		Include  []interface{} `json:"include"`
+		Exclude  []interface{} `json:"exclude"`
+		Require  []interface{} `json:"require"`
+	} `json:"result"`
+}
+
+type CFAccessPolicyUpdate struct {
+	Name     string        `json:"name"`
+	Decision string        `json:"decision"`
+	Include  []interface{} `json:"include"`
+	Exclude  []interface{} `json:"exclude"`
+	Require  []interface{} `json:"require"`
+}
+
+func cfRequest(ctx context.Context, method, path string, body interface{}) (*CFAccessPolicyResponse, error) {
+	url := fmt.Sprintf("https://api.cloudflare.com/client/v4/accounts/%s/%s", accountID, path)
+
+	var bodyReader io.Reader
+	if body != nil {
+		b, _ := json.Marshal(body)
+		bodyReader = bytes.NewReader(b)
+	}
+
+	req, err := http.NewRequestWithContext(ctx, method, url, bodyReader)
+	if err != nil {
+		return nil, err
+	}
+
+	req.Header.Set("Authorization", "Bearer "+apiToken)
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	var res CFAccessPolicyResponse
+	if err := json.NewDecoder(resp.Body).Decode(&res); err != nil {
+		return nil, err
+	}
+
+	if !res.Success {
+		return nil, fmt.Errorf("CF API Error: %v", res.Errors)
+	}
+	return &res, nil
+}
+
+// addToCloudflareAccessPolicy adds the IP to a reusable Access Policy.
+func addToCloudflareAccessPolicy(ctx context.Context, ip string) error {
+	if apiToken == "" || accountID == "" || policyID == "" {
+		return nil
+	}
+
+	// 1. Get Policy
+	res, err := cfRequest(ctx, "GET", fmt.Sprintf("access/policies/%s", policyID), nil)
+	if err != nil {
+		return err
+	}
+	policy := res.Result
+
+	// 2. Check if exists
+	exists := false
+	for _, rule := range policy.Include {
+		b, _ := json.Marshal(rule)
+		if strings.Contains(string(b), fmt.Sprintf(`"ip":"%s"`, ip)) {
+			exists = true
+			break
+		}
+	}
+	if exists {
+		return nil
+	}
+
+	// 3. Add IP
+	newRule := map[string]interface{}{
+		"ip": map[string]string{"ip": ip},
+	}
+	policy.Include = append(policy.Include, newRule)
+
+	// 4. Update
+	updatePayload := CFAccessPolicyUpdate{
+		Name:     policy.Name,
+		Decision: policy.Decision,
+		Include:  policy.Include,
+		Exclude:  policy.Exclude,
+		Require:  policy.Require,
+	}
+
+	_, err = cfRequest(ctx, "PUT", fmt.Sprintf("access/policies/%s", policyID), updatePayload)
+	return err
+}
+
+func removeFromCloudflareAccessPolicy(ctx context.Context, ip string) error {
+	if apiToken == "" || accountID == "" || policyID == "" {
+		return nil
+	}
+
+	// 1. Get Policy
+	res, err := cfRequest(ctx, "GET", fmt.Sprintf("access/policies/%s", policyID), nil)
+	if err != nil {
+		return err
+	}
+	policy := res.Result
+
+	// 2. Filter IP
+	newIncludes := []interface{}{}
+	for _, rule := range policy.Include {
+		b, _ := json.Marshal(rule)
+		s := string(b)
+		// Check for ip or ip/32
+		if strings.Contains(s, fmt.Sprintf(`"ip":"%s"`, ip)) || strings.Contains(s, fmt.Sprintf(`"ip":"%s/32"`, ip)) {
+			continue
+		}
+		newIncludes = append(newIncludes, rule)
+	}
+
+	if len(newIncludes) == len(policy.Include) {
+		return nil // Nothing to remove
+	}
+
+	// 3. Update
+	updatePayload := CFAccessPolicyUpdate{
+		Name:     policy.Name,
+		Decision: policy.Decision,
+		Include:  newIncludes,
+		Exclude:  policy.Exclude,
+		Require:  policy.Require,
+	}
+
+	_, err = cfRequest(ctx, "PUT", fmt.Sprintf("access/policies/%s", policyID), updatePayload)
+	return err
+}
+
+func startExpiryDaemon() {
+	ticker := time.NewTicker(10 * time.Second)
+	log.Println("Expiry daemon started")
+	for range ticker.C {
+		now := time.Now()
+
+		// Snapshot entries to avoid long lock
+		store.RLock()
+		toRemove := []string{}
+		for ip, expiry := range store.Entries {
+			if now.After(expiry) {
+				toRemove = append(toRemove, ip)
+			}
+		}
+		store.RUnlock()
+
+		for _, ip := range toRemove {
+			log.Printf("Daemon: Removing expired IP %s", ip)
+			if err := removeFromCloudflareAccessPolicy(context.Background(), ip); err != nil {
+				log.Printf("Daemon: Error removing IP %s: %v", ip, err)
+			} else {
+				// Only remove from store if successfully removed from Cloudflare (or if error is not temporary?)
+				// For this MVP, we remove from store to avoid loop.
+			}
+			store.Remove(ip)
+		}
+	}
+}
+
+// FileServer conveniently sets up a http.FileServer handler to serve
+// static files from a http.FileSystem.
+func FileServer(r chi.Router, path string, root http.FileSystem) {
+	if strings.ContainsAny(path, "{}*") {
+		panic("FileServer does not permit any URL parameters.")
+	}
+
+	if path != "/" && path[len(path)-1] != '/' {
+		r.Get(path, http.RedirectHandler(path+"/", 301).ServeHTTP)
+		path += "/"
+	}
+	path += "*"
+
+	r.Get(path, func(w http.ResponseWriter, r *http.Request) {
+		rctx := chi.RouteContext(r.Context())
+		pathPrefix := strings.TrimSuffix(rctx.RoutePattern(), "/*")
+		fs := http.StripPrefix(pathPrefix, http.FileServer(root))
+		fs.ServeHTTP(w, r)
+	})
+}

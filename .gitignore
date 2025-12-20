@@ -1,0 +1,23 @@
+# Secrets
+.env
+backend/.env
+
+# State / Persistence
+whitelist_store.json
+backend/whitelist_store.json
+
+# Dependencies
+node_modules/
+backend/vendor/
+
+# Build Artifacts
+dist/
+backend/server
+backend/white-list-ip-service
+cloudflare-whitelist-ip-service
+
+# Temporary Scripts
+scripts/
+
+# OS
+.DS_Store

@@ -1,0 +1,18 @@
+version: '3.8'
+
+services:
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: cloudflare-whitelist-ip-service
+    container_name: cloudflare-whitelist-ip-service
+    ports:
+      - "8080:8080"
+    # Load environment variables from backend/.env
+    env_file:
+      - backend/.env
+    # Explicitly set PORT if not in .env, though .env usually wins
+    environment:
+      - PORT=8080
+    restart: unless-stopped
