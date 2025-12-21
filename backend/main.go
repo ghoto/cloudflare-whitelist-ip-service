@@ -120,12 +120,27 @@ func main() {
 	log.Printf("Cloudflare Account ID: %s", maskString(accountID))
 	log.Printf("Cloudflare Policy ID: %s", maskString(policyID))
 
+	// Require all Cloudflare credentials
 	if apiToken == "" || accountID == "" || policyID == "" {
-		log.Println("WARNING: Cloudflare credentials not fully configured!")
-		log.Println("WARNING: IPs will only be stored locally, not added to Cloudflare policy")
-	} else {
-		log.Println("Cloudflare integration: ENABLED")
+		log.Println("")
+		log.Println("ERROR: Missing required Cloudflare credentials!")
+		log.Println("The following environment variables must be set:")
+		if apiToken == "" {
+			log.Println("  - CLOUDFLARE_API_TOKEN")
+		}
+		if accountID == "" {
+			log.Println("  - CLOUDFLARE_ACCOUNT_ID")
+		}
+		if policyID == "" {
+			log.Println("  - CLOUDFLARE_POLICY_ID")
+		}
+		log.Println("")
+		log.Println("Please set these variables in your .env file and restart.")
+		log.Fatal("Exiting due to missing configuration")
 	}
+
+	log.Println("Cloudflare integration: ENABLED")
+	log.Println("")
 
 	r := chi.NewRouter()
 
