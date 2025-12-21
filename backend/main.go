@@ -113,8 +113,18 @@ func main() {
 		port = "8080"
 	}
 
-	if apiToken == "" {
-		log.Println("Warning: CLOUDFLARE_API_TOKEN is not set")
+	// Log configuration status
+	log.Println("=== Cloudflare IP Whitelist Service ===")
+	log.Printf("Port: %s", port)
+	log.Printf("Cloudflare API Token: %s", maskString(apiToken))
+	log.Printf("Cloudflare Account ID: %s", maskString(accountID))
+	log.Printf("Cloudflare Policy ID: %s", maskString(policyID))
+
+	if apiToken == "" || accountID == "" || policyID == "" {
+		log.Println("WARNING: Cloudflare credentials not fully configured!")
+		log.Println("WARNING: IPs will only be stored locally, not added to Cloudflare policy")
+	} else {
+		log.Println("Cloudflare integration: ENABLED")
 	}
 
 	r := chi.NewRouter()
@@ -218,16 +228,31 @@ func handleStatus(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Check local store
 	store.RLock()
-	expiry, exists := store.Entries[ip]
+	expiry, existsInStore := store.Entries[ip]
 	store.RUnlock()
+
+	// Also check Cloudflare policy if credentials are configured
+	existsInCloudflare := false
+	if apiToken != "" && accountID != "" && policyID != "" {
+		if err := checkIPInCloudflarePolicy(r.Context(), ip); err == nil {
+			existsInCloudflare = true
+		}
+	}
+
+	// IP is whitelisted if it exists in BOTH store AND Cloudflare (or if Cloudflare is not configured)
+	whitelisted := existsInStore
+	if apiToken != "" && accountID != "" && policyID != "" {
+		whitelisted = existsInStore && existsInCloudflare
+	}
 
 	resp := StatusResponse{
 		IP:          ip,
-		Whitelisted: exists,
+		Whitelisted: whitelisted,
 	}
 
-	if exists {
+	if existsInStore {
 		resp.ExpiresAt = expiry.Format(time.RFC3339)
 		timeRemaining := time.Until(expiry)
 		resp.TimeRemaining = formatTimeRemaining(timeRemaining)
@@ -437,6 +462,38 @@ type CFAccessPolicyUpdate struct {
 	Include  []interface{} `json:"include"`
 	Exclude  []interface{} `json:"exclude"`
 	Require  []interface{} `json:"require"`
+}
+
+// maskString masks sensitive strings for logging
+func maskString(s string) string {
+	if s == "" {
+		return "(not set)"
+	}
+	if len(s) <= 8 {
+		return "****"
+	}
+	return s[:4] + "****" + s[len(s)-4:]
+}
+
+// checkIPInCloudflarePolicy checks if an IP exists in the Cloudflare policy
+func checkIPInCloudflarePolicy(ctx context.Context, ip string) error {
+	if apiToken == "" || accountID == "" || policyID == "" {
+		return fmt.Errorf("cloudflare credentials not configured")
+	}
+
+	res, err := cfRequest(ctx, "GET", fmt.Sprintf("access/policies/%s", policyID), nil)
+	if err != nil {
+		return err
+	}
+
+	for _, rule := range res.Result.Include {
+		b, _ := json.Marshal(rule)
+		if strings.Contains(string(b), fmt.Sprintf(`"ip":"%s"`, ip)) {
+			return nil // Found
+		}
+	}
+
+	return fmt.Errorf("IP not found in policy")
 }
 
 func cfRequest(ctx context.Context, method, path string, body interface{}) (*CFAccessPolicyResponse, error) {
