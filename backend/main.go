@@ -323,16 +323,14 @@ func handleWhitelist(w http.ResponseWriter, r *http.Request) {
 		// 4. Update Cloudflare (only for new IPs)
 		if err := addToCloudflareAccessPolicy(r.Context(), ip); err != nil {
 			log.Printf("Error updating Cloudflare: %v", err)
-			if apiToken != "" {
-				http.Error(w, "Failed to update Cloudflare policy", http.StatusInternalServerError)
-				return
-			}
-		} else {
-			// Persist Expiry
-			expiry := time.Now().Add(duration)
-			store.Add(ip, expiry)
-			log.Printf("IP %s added to store, expires at %s", ip, expiry)
+			http.Error(w, fmt.Sprintf("Failed to update Cloudflare policy: %v", err), http.StatusInternalServerError)
+			return
 		}
+
+		// Persist Expiry only after successful Cloudflare update
+		expiry := time.Now().Add(duration)
+		store.Add(ip, expiry)
+		log.Printf("IP %s added to store, expires at %s", ip, expiry)
 	}
 
 	resp := WhitelistResponse{
@@ -482,6 +480,8 @@ func addToCloudflareAccessPolicy(ctx context.Context, ip string) error {
 		return nil
 	}
 
+	log.Printf("[Cloudflare] Attempting to add IP %s to policy %s", ip, policyID)
+
 	// 1. Get Policy
 	res, err := cfRequest(ctx, "GET", fmt.Sprintf("access/policies/%s", policyID), nil)
 	if err != nil {
@@ -499,7 +499,7 @@ func addToCloudflareAccessPolicy(ctx context.Context, ip string) error {
 		}
 	}
 	if exists {
-		log.Printf("IP %s already exists in Cloudflare policy, skipping add", ip)
+		log.Printf("[Cloudflare] IP %s already exists in policy, skipping add", ip)
 		return nil
 	}
 
@@ -518,11 +518,33 @@ func addToCloudflareAccessPolicy(ctx context.Context, ip string) error {
 		Require:  policy.Require,
 	}
 
+	log.Printf("[Cloudflare] Sending PUT request to update policy")
 	_, err = cfRequest(ctx, "PUT", fmt.Sprintf("access/policies/%s", policyID), updatePayload)
 	if err != nil {
 		return fmt.Errorf("failed to update policy: %w", err)
 	}
-	log.Printf("Successfully added IP %s to Cloudflare policy", ip)
+
+	// 5. Verify the IP was added
+	log.Printf("[Cloudflare] Verifying IP %s was added to policy", ip)
+	verifyRes, err := cfRequest(ctx, "GET", fmt.Sprintf("access/policies/%s", policyID), nil)
+	if err != nil {
+		return fmt.Errorf("failed to verify policy update: %w", err)
+	}
+
+	verified := false
+	for _, rule := range verifyRes.Result.Include {
+		b, _ := json.Marshal(rule)
+		if strings.Contains(string(b), fmt.Sprintf(`"ip":"%s"`, ip)) {
+			verified = true
+			break
+		}
+	}
+
+	if !verified {
+		return fmt.Errorf("verification failed: IP %s not found in policy after update", ip)
+	}
+
+	log.Printf("[Cloudflare] Successfully added and verified IP %s in policy", ip)
 	return nil
 }
 
@@ -531,6 +553,8 @@ func removeFromCloudflareAccessPolicy(ctx context.Context, ip string) error {
 		log.Println("Skipping Cloudflare removal: API credentials not configured")
 		return nil
 	}
+
+	log.Printf("[Cloudflare] Attempting to remove IP %s from policy %s", ip, policyID)
 
 	// 1. Get Policy
 	res, err := cfRequest(ctx, "GET", fmt.Sprintf("access/policies/%s", policyID), nil)
@@ -548,14 +572,14 @@ func removeFromCloudflareAccessPolicy(ctx context.Context, ip string) error {
 		// Check for ip or ip/32
 		if strings.Contains(s, fmt.Sprintf(`"ip":"%s"`, ip)) || strings.Contains(s, fmt.Sprintf(`"ip":"%s/32"`, ip)) {
 			removed = true
-			log.Printf("Found and removing IP %s from policy", ip)
+			log.Printf("[Cloudflare] Found IP %s in policy, removing", ip)
 			continue
 		}
 		newIncludes = append(newIncludes, rule)
 	}
 
 	if !removed {
-		log.Printf("IP %s not found in Cloudflare policy, nothing to remove", ip)
+		log.Printf("[Cloudflare] IP %s not found in policy, nothing to remove", ip)
 		return nil
 	}
 
@@ -568,11 +592,28 @@ func removeFromCloudflareAccessPolicy(ctx context.Context, ip string) error {
 		Require:  policy.Require,
 	}
 
+	log.Printf("[Cloudflare] Sending PUT request to remove IP from policy")
 	_, err = cfRequest(ctx, "PUT", fmt.Sprintf("access/policies/%s", policyID), updatePayload)
 	if err != nil {
 		return fmt.Errorf("failed to update policy: %w", err)
 	}
-	log.Printf("Successfully removed IP %s from Cloudflare policy", ip)
+
+	// 4. Verify the IP was removed
+	log.Printf("[Cloudflare] Verifying IP %s was removed from policy", ip)
+	verifyRes, err := cfRequest(ctx, "GET", fmt.Sprintf("access/policies/%s", policyID), nil)
+	if err != nil {
+		return fmt.Errorf("failed to verify policy update: %w", err)
+	}
+
+	for _, rule := range verifyRes.Result.Include {
+		b, _ := json.Marshal(rule)
+		s := string(b)
+		if strings.Contains(s, fmt.Sprintf(`"ip":"%s"`, ip)) || strings.Contains(s, fmt.Sprintf(`"ip":"%s/32"`, ip)) {
+			return fmt.Errorf("verification failed: IP %s still found in policy after removal", ip)
+		}
+	}
+
+	log.Printf("[Cloudflare] Successfully removed and verified IP %s from policy", ip)
 	return nil
 }
 
