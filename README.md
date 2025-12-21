@@ -69,6 +69,12 @@ docker-compose up --build -d
 
 The service will be available at `http://localhost:8080`
 
+**Or use the pre-built Docker image from GitHub Container Registry:**
+
+```bash
+docker pull ghcr.io/ghoto/cloudflare-whitelist-ip-service:master
+```
+
 ### 3. Access the Application
 
 1. Visit `http://localhost:8080` in your browser
