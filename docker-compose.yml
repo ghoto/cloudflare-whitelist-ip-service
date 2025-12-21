@@ -1,9 +1,7 @@
 services:
   app:
-    build:
-      context: .
-      dockerfile: Dockerfile
-    image: cloudflare-whitelist-ip-service
+    image: ghcr.io/ghoto/cloudflare-whitelist-ip-service:master
+    pull_policy: always
     container_name: cloudflare-whitelist-ip-service
     ports:
       - "8080:8080"
