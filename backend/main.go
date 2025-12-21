@@ -250,19 +250,10 @@ func handleDeleteWhitelist(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Check if IP exists in store
-	store.RLock()
-	_, exists := store.Entries[ip]
-	store.RUnlock()
-
-	if !exists {
-		http.Error(w, "IP not found in whitelist", http.StatusNotFound)
-		return
-	}
-
 	log.Printf("Removing IP from whitelist: %s", ip)
 
-	// Remove from Cloudflare
+	// Always attempt to remove from Cloudflare (even if not in local store)
+	// This ensures sync if local store and Cloudflare are out of sync
 	if err := removeFromCloudflareAccessPolicy(r.Context(), ip); err != nil {
 		log.Printf("Error removing from Cloudflare: %v", err)
 		if apiToken != "" {
@@ -271,9 +262,9 @@ func handleDeleteWhitelist(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	// Remove from store
+	// Remove from store (if exists)
 	store.Remove(ip)
-	log.Printf("IP %s removed from whitelist", ip)
+	log.Printf("IP %s removed from whitelist and Cloudflare policy", ip)
 
 	resp := map[string]string{
 		"message": "IP removed from whitelist",
@@ -487,13 +478,14 @@ func cfRequest(ctx context.Context, method, path string, body interface{}) (*CFA
 // addToCloudflareAccessPolicy adds the IP to a reusable Access Policy.
 func addToCloudflareAccessPolicy(ctx context.Context, ip string) error {
 	if apiToken == "" || accountID == "" || policyID == "" {
+		log.Println("Skipping Cloudflare update: API credentials not configured")
 		return nil
 	}
 
 	// 1. Get Policy
 	res, err := cfRequest(ctx, "GET", fmt.Sprintf("access/policies/%s", policyID), nil)
 	if err != nil {
-		return err
+		return fmt.Errorf("failed to get policy: %w", err)
 	}
 	policy := res.Result
 
@@ -507,6 +499,7 @@ func addToCloudflareAccessPolicy(ctx context.Context, ip string) error {
 		}
 	}
 	if exists {
+		log.Printf("IP %s already exists in Cloudflare policy, skipping add", ip)
 		return nil
 	}
 
@@ -526,35 +519,44 @@ func addToCloudflareAccessPolicy(ctx context.Context, ip string) error {
 	}
 
 	_, err = cfRequest(ctx, "PUT", fmt.Sprintf("access/policies/%s", policyID), updatePayload)
-	return err
+	if err != nil {
+		return fmt.Errorf("failed to update policy: %w", err)
+	}
+	log.Printf("Successfully added IP %s to Cloudflare policy", ip)
+	return nil
 }
 
 func removeFromCloudflareAccessPolicy(ctx context.Context, ip string) error {
 	if apiToken == "" || accountID == "" || policyID == "" {
+		log.Println("Skipping Cloudflare removal: API credentials not configured")
 		return nil
 	}
 
 	// 1. Get Policy
 	res, err := cfRequest(ctx, "GET", fmt.Sprintf("access/policies/%s", policyID), nil)
 	if err != nil {
-		return err
+		return fmt.Errorf("failed to get policy: %w", err)
 	}
 	policy := res.Result
 
 	// 2. Filter IP
 	newIncludes := []interface{}{}
+	removed := false
 	for _, rule := range policy.Include {
 		b, _ := json.Marshal(rule)
 		s := string(b)
 		// Check for ip or ip/32
 		if strings.Contains(s, fmt.Sprintf(`"ip":"%s"`, ip)) || strings.Contains(s, fmt.Sprintf(`"ip":"%s/32"`, ip)) {
+			removed = true
+			log.Printf("Found and removing IP %s from policy", ip)
 			continue
 		}
 		newIncludes = append(newIncludes, rule)
 	}
 
-	if len(newIncludes) == len(policy.Include) {
-		return nil // Nothing to remove
+	if !removed {
+		log.Printf("IP %s not found in Cloudflare policy, nothing to remove", ip)
+		return nil
 	}
 
 	// 3. Update
@@ -567,7 +569,11 @@ func removeFromCloudflareAccessPolicy(ctx context.Context, ip string) error {
 	}
 
 	_, err = cfRequest(ctx, "PUT", fmt.Sprintf("access/policies/%s", policyID), updatePayload)
-	return err
+	if err != nil {
+		return fmt.Errorf("failed to update policy: %w", err)
+	}
+	log.Printf("Successfully removed IP %s from Cloudflare policy", ip)
+	return nil
 }
 
 func startExpiryDaemon() {
