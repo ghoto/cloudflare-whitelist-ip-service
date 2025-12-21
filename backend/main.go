@@ -28,6 +28,13 @@ type WhitelistResponse struct {
 	IP      string `json:"ip"`
 }
 
+type StatusResponse struct {
+	IP            string `json:"ip"`
+	Whitelisted   bool   `json:"whitelisted"`
+	ExpiresAt     string `json:"expiresAt,omitempty"`
+	TimeRemaining string `json:"timeRemaining,omitempty"`
+}
+
 var (
 	apiToken = os.Getenv("CLOUDFLARE_API_TOKEN")
 	zoneID   = os.Getenv("CLOUDFLARE_ZONE_ID")
@@ -130,7 +137,9 @@ func main() {
 	FileServer(r, "/", filesDir)
 
 	r.Get("/ip", handleGetIP)
+	r.Get("/status", handleStatus)
 	r.Post("/whitelist", handleWhitelist)
+	r.Delete("/whitelist", handleDeleteWhitelist)
 
 	// Load state
 	if err := store.Load(); err != nil {
@@ -151,6 +160,126 @@ func main() {
 func handleGetIP(w http.ResponseWriter, r *http.Request) {
 	ip := getClientIP(r)
 	resp := map[string]string{"ip": ip}
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(resp)
+}
+
+// formatTimeRemaining converts a duration to a human-readable format
+// e.g., "2 hours 15 minutes" or "45 minutes" or "30 seconds"
+func formatTimeRemaining(d time.Duration) string {
+	if d <= 0 {
+		return "expired"
+	}
+
+	hours := int(d.Hours())
+	minutes := int(d.Minutes()) % 60
+	seconds := int(d.Seconds()) % 60
+
+	var parts []string
+	if hours > 0 {
+		if hours == 1 {
+			parts = append(parts, "1 hour")
+		} else {
+			parts = append(parts, fmt.Sprintf("%d hours", hours))
+		}
+	}
+	if minutes > 0 {
+		if minutes == 1 {
+			parts = append(parts, "1 minute")
+		} else {
+			parts = append(parts, fmt.Sprintf("%d minutes", minutes))
+		}
+	}
+	if seconds > 0 && hours == 0 { // Only show seconds if less than an hour
+		if seconds == 1 {
+			parts = append(parts, "1 second")
+		} else {
+			parts = append(parts, fmt.Sprintf("%d seconds", seconds))
+		}
+	}
+
+	if len(parts) == 0 {
+		return "less than a second"
+	}
+
+	return strings.Join(parts, " ")
+}
+
+func handleStatus(w http.ResponseWriter, r *http.Request) {
+	ip := getClientIP(r)
+	if ip == "" {
+		http.Error(w, "Could not determine client IP", http.StatusBadRequest)
+		return
+	}
+
+	// Validate IP
+	if net.ParseIP(ip) == nil {
+		http.Error(w, "Invalid IP address detected", http.StatusBadRequest)
+		return
+	}
+
+	store.RLock()
+	expiry, exists := store.Entries[ip]
+	store.RUnlock()
+
+	resp := StatusResponse{
+		IP:          ip,
+		Whitelisted: exists,
+	}
+
+	if exists {
+		resp.ExpiresAt = expiry.Format(time.RFC3339)
+		timeRemaining := time.Until(expiry)
+		resp.TimeRemaining = formatTimeRemaining(timeRemaining)
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(resp)
+}
+
+func handleDeleteWhitelist(w http.ResponseWriter, r *http.Request) {
+	ip := getClientIP(r)
+	if ip == "" {
+		http.Error(w, "Could not determine client IP", http.StatusBadRequest)
+		return
+	}
+
+	// Validate IP
+	if net.ParseIP(ip) == nil {
+		http.Error(w, "Invalid IP address detected", http.StatusBadRequest)
+		return
+	}
+
+	// Check if IP exists in store
+	store.RLock()
+	_, exists := store.Entries[ip]
+	store.RUnlock()
+
+	if !exists {
+		http.Error(w, "IP not found in whitelist", http.StatusNotFound)
+		return
+	}
+
+	log.Printf("Removing IP from whitelist: %s", ip)
+
+	// Remove from Cloudflare
+	if err := removeFromCloudflareAccessPolicy(r.Context(), ip); err != nil {
+		log.Printf("Error removing from Cloudflare: %v", err)
+		if apiToken != "" {
+			http.Error(w, "Failed to remove from Cloudflare policy", http.StatusInternalServerError)
+			return
+		}
+	}
+
+	// Remove from store
+	store.Remove(ip)
+	log.Printf("IP %s removed from whitelist", ip)
+
+	resp := map[string]string{
+		"message": "IP removed from whitelist",
+		"ip":      ip,
+	}
+
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(resp)
 }
@@ -186,20 +315,33 @@ func handleWhitelist(w http.ResponseWriter, r *http.Request) {
 		duration = d
 	}
 
-	log.Printf("Whitelisting IP: %s for %v", ip, duration)
+	// 3. Check if IP already exists (extension case)
+	store.RLock()
+	existingExpiry, exists := store.Entries[ip]
+	store.RUnlock()
 
-	// 3. Update Cloudflare
-	if err := addToCloudflareAccessPolicy(r.Context(), ip); err != nil {
-		log.Printf("Error updating Cloudflare: %v", err)
-		if apiToken != "" {
-			http.Error(w, "Failed to update Cloudflare policy", http.StatusInternalServerError)
-			return
-		}
+	if exists {
+		log.Printf("Extending whitelist for IP: %s by %v (current expiry: %s)", ip, duration, existingExpiry)
+		// Extend from now, not from existing expiry
+		newExpiry := time.Now().Add(duration)
+		store.Add(ip, newExpiry)
+		log.Printf("IP %s expiry extended to %s", ip, newExpiry)
 	} else {
-		// Persist Expiry
-		expiry := time.Now().Add(duration)
-		store.Add(ip, expiry)
-		log.Printf("IP %s added to store, expires at %s", ip, expiry)
+		log.Printf("Whitelisting IP: %s for %v", ip, duration)
+
+		// 4. Update Cloudflare (only for new IPs)
+		if err := addToCloudflareAccessPolicy(r.Context(), ip); err != nil {
+			log.Printf("Error updating Cloudflare: %v", err)
+			if apiToken != "" {
+				http.Error(w, "Failed to update Cloudflare policy", http.StatusInternalServerError)
+				return
+			}
+		} else {
+			// Persist Expiry
+			expiry := time.Now().Add(duration)
+			store.Add(ip, expiry)
+			log.Printf("IP %s added to store, expires at %s", ip, expiry)
+		}
 	}
 
 	resp := WhitelistResponse{
