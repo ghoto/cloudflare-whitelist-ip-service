@@ -48,11 +48,18 @@ var (
 	policyID  = os.Getenv("CLOUDFLARE_POLICY_ID")
 
 	// Persistence
-	storeFile = "whitelist_store.json"
+	storeFile = getEnv("WHITELIST_STORE", "whitelist_store.json")
 	store     = &WhitelistStore{
 		Entries: make(map[string]time.Time),
 	}
 )
+
+func getEnv(key, fallback string) string {
+	if value, ok := os.LookupEnv(key); ok {
+		return value
+	}
+	return fallback
+}
 
 // WhitelistStore handles persistence
 type WhitelistStore struct {

@@ -1,5 +1,6 @@
 services:
   app:
+    build: .
     image: ghcr.io/ghoto/cloudflare-whitelist-ip-service:master
     pull_policy: always
     container_name: cloudflare-whitelist-ip-service
@@ -11,9 +12,10 @@ services:
     # Explicitly set PORT if not in .env, though .env usually wins
     environment:
       - PORT=8080
+      - WHITELIST_STORE=/data/whitelist_store.json
     # Persist whitelist data across container restarts
     volumes:
-      - whitelist-data:/root
+      - whitelist-data:/data
     restart: unless-stopped
 
 volumes:
