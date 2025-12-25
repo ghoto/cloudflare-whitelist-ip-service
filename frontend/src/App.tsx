@@ -1,4 +1,4 @@
-import { Container, Title, Paper, Button, Select, Text, Center, Stack, Loader, Group, Badge, Alert } from '@mantine/core';
+import { Container, Title, Paper, Button, Slider, Text, Center, Stack, Loader, Group, Badge, Alert } from '@mantine/core';
 import { useForm } from '@mantine/form';
 import { useState, useEffect } from 'react';
 
@@ -17,7 +17,7 @@ function App() {
 
   const form = useForm({
     initialValues: {
-      duration: '60',
+      duration: 1, // Default 1 day
     },
   });
 
@@ -49,7 +49,7 @@ function App() {
       headers: {
         'Content-Type': 'application/json',
       },
-      body: JSON.stringify({ duration: values.duration }),
+      body: JSON.stringify({ duration: (values.duration * 1440).toString() }), // Convert days to minutes
     })
       .then(res => {
         if (!res.ok) throw new Error('Network response was not ok');
@@ -147,15 +147,18 @@ function App() {
             {!loadingStatus && !status?.whitelisted && (
               <form onSubmit={form.onSubmit(handleWhitelist)}>
                 <Stack gap="md">
-                  <Select
-                    label="Duration"
-                    placeholder="Select duration"
-                    data={[
-                      { value: '60', label: '1 Hour' },
-                      { value: '240', label: '4 Hours' },
-                      { value: '480', label: '8 Hours' },
-                      { value: '1440', label: '24 Hours' },
+                  <Text size="sm" fw={500} mb={5}>Duration (days)</Text>
+                  <Slider
+                    min={1}
+                    max={30}
+                    step={1}
+                    marks={[
+                      { value: 1, label: '1d' },
+                      { value: 7, label: '7d' },
+                      { value: 15, label: '15d' },
+                      { value: 30, label: '30d' },
                     ]}
+                    mb="xl"
                     {...form.getInputProps('duration')}
                   />
 

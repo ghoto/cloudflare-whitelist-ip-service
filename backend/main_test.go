@@ -188,3 +188,56 @@ func TestHandleWhitelistIPValidation(t *testing.T) {
 		})
 	}
 }
+
+func TestFormatTimeRemaining(t *testing.T) {
+	tests := []struct {
+		name     string
+		duration time.Duration
+		expected string
+	}{
+		{
+			name:     "Less than a minute",
+			duration: 30 * time.Second,
+			expected: "30 seconds",
+		},
+		{
+			name:     "Minutes and seconds",
+			duration: 2*time.Minute + 15*time.Second,
+			expected: "2 minutes 15 seconds",
+		},
+		{
+			name:     "Hours and minutes",
+			duration: 2*time.Hour + 30*time.Minute,
+			expected: "2 hours 30 minutes",
+		},
+		{
+			name:     "Exactly one day",
+			duration: 24 * time.Hour,
+			expected: "1 day",
+		},
+		{
+			name:     "One day and some hours",
+			duration: 25 * time.Hour,
+			expected: "1 day 1 hour",
+		},
+		{
+			name:     "Multiple days and hours",
+			duration: 49 * time.Hour,
+			expected: "2 days 1 hour",
+		},
+		{
+			name:     "Thirty days",
+			duration: 30 * 24 * time.Hour,
+			expected: "30 days",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := formatTimeRemaining(tt.duration)
+			if got != tt.expected {
+				t.Errorf("formatTimeRemaining(%v) = %v, want %v", tt.duration, got, tt.expected)
+			}
+		})
+	}
+}

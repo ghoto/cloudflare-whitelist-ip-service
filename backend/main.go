@@ -196,11 +196,19 @@ func formatTimeRemaining(d time.Duration) string {
 		return "expired"
 	}
 
-	hours := int(d.Hours())
+	days := int(d.Hours() / 24)
+	hours := int(d.Hours()) % 24
 	minutes := int(d.Minutes()) % 60
 	seconds := int(d.Seconds()) % 60
 
 	var parts []string
+	if days > 0 {
+		if days == 1 {
+			parts = append(parts, "1 day")
+		} else {
+			parts = append(parts, fmt.Sprintf("%d days", days))
+		}
+	}
 	if hours > 0 {
 		if hours == 1 {
 			parts = append(parts, "1 hour")
@@ -208,14 +216,14 @@ func formatTimeRemaining(d time.Duration) string {
 			parts = append(parts, fmt.Sprintf("%d hours", hours))
 		}
 	}
-	if minutes > 0 {
+	if minutes > 0 && days == 0 { // Only show minutes if less than a day
 		if minutes == 1 {
 			parts = append(parts, "1 minute")
 		} else {
 			parts = append(parts, fmt.Sprintf("%d minutes", minutes))
 		}
 	}
-	if seconds > 0 && hours == 0 { // Only show seconds if less than an hour
+	if seconds > 0 && days == 0 && hours == 0 { // Only show seconds if less than an hour
 		if seconds == 1 {
 			parts = append(parts, "1 second")
 		} else {
@@ -224,7 +232,10 @@ func formatTimeRemaining(d time.Duration) string {
 	}
 
 	if len(parts) == 0 {
-		return "less than a second"
+		if days > 0 {
+			return fmt.Sprintf("%d days", days)
+		}
+		return "less than a minute"
 	}
 
 	return strings.Join(parts, " ")
@@ -342,7 +353,7 @@ func handleWhitelist(w http.ResponseWriter, r *http.Request) {
 	if d, err := time.ParseDuration(req.Duration + "m"); err == nil {
 		duration = d
 	} else if d, err := time.ParseDuration(req.Duration); err == nil {
-		// Fallback for "30s" etc
+		// Fallback for "30s" or "720h" etc
 		duration = d
 	}
 
